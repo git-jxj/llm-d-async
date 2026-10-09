@@ -812,8 +812,12 @@ func (r *RedisSortedSetFlow) processMessagesWithConfig(ctx context.Context, msgC
 		return
 	}
 
+	var ready []claimedRequest
+	handled := 0
+	defer func() { r.releaseClaimed(queueName, ready[handled:], logger) }()
+
 	for _, z := range zs {
-		member := z.Member.(string)
+		member, _ := z.Member.(string)
 		ir, deadline, ok := r.parseMessage(member, logger)
 		if !ok || ir == nil || ir.PublicRequest == nil {
 			// Unparsable entry: no request identity survives to redeliver,
@@ -973,30 +977,124 @@ func (r *RedisSortedSetFlow) processMessagesWithConfig(ctx context.Context, msgC
 			pipeline.ReleaseGateReleases(releases)
 			continue
 		}
-
-		if len(releases) > 0 {
-			// Defensive: never orphan a lingering reservation for this id — release
-			// any prior closure instead of silently overwriting it (see #311).
-			if prev, loaded := r.activeReleases.Swap(reqID, releases); loaded {
-				if rels, ok := prev.([]pipeline.GateReleaseFunc); ok {
-					pipeline.ReleaseGateReleases(rels)
-				}
-			}
+		if ir.PayloadRef != "" {
+			ready = append(ready, claimedRequest{ir: ir, member: member, token: token, releases: releases})
+			continue
 		}
-
-		// Stamp ingestion time as the message enters the in-process buffer so the
-		// worker can record queue residence time when it pulls the message.
-		ir.IngestionTime = time.Now()
-
-		select {
-		case msgChannel <- ir:
-		case <-ctx.Done():
-			r.activeReleases.Delete(reqID)
+		if !r.dispatch(ctx, msgChannel, ir, releases) {
 			releaseOnShutdown(token, ir.RequestToken)
 			pipeline.ReleaseGateReleases(releases)
 			return
 		}
 	}
+
+	if len(ready) == 0 {
+		return
+	}
+	payloadErrs, err := r.fetchPayloads(ctx, ready)
+	if err != nil {
+		logger.V(logutil.DEFAULT).Error(err, "Failed to load request payloads", "queue", queueName)
+		return
+	}
+
+	for i, c := range ready {
+		ir := c.ir
+		if payloadErrs[i] != "" {
+			select {
+			case r.resultChannel <- api.NewErrorResult(ir.PublicRequest, ir.InternalRouting, api.ErrCodePayloadUnavailable, payloadErrs[i]):
+			case <-ctx.Done():
+				return
+			}
+			pipeline.ReleaseGateReleases(c.releases)
+			handled++
+			continue
+		}
+		if !r.dispatch(ctx, msgChannel, ir, c.releases) {
+			return
+		}
+		handled++
+	}
+}
+
+// dispatch hands a claimed request downstream, reporting false when ctx ends
+// first.
+func (r *RedisSortedSetFlow) dispatch(ctx context.Context, msgChannel chan *api.InternalRequest, ir *api.InternalRequest, releases []pipeline.GateReleaseFunc) bool {
+	reqID := ir.PublicRequest.ReqID()
+	if len(releases) > 0 {
+		// Defensive: never orphan a lingering reservation for this id — release
+		// any prior closure instead of silently overwriting it (see #311).
+		if prev, loaded := r.activeReleases.Swap(reqID, releases); loaded {
+			if rels, ok := prev.([]pipeline.GateReleaseFunc); ok {
+				pipeline.ReleaseGateReleases(rels)
+			}
+		}
+	}
+
+	// Stamp ingestion time as the message enters the in-process buffer so the
+	// worker can record queue residence time when it pulls the message.
+	ir.IngestionTime = time.Now()
+
+	select {
+	case msgChannel <- ir:
+		return true
+	case <-ctx.Done():
+		r.activeReleases.Delete(reqID)
+		return false
+	}
+}
+
+type claimedRequest struct {
+	ir       *api.InternalRequest
+	member   string
+	token    string
+	releases []pipeline.GateReleaseFunc
+}
+
+// releaseClaimed hands claimed requests that were never dispatched back to
+// the queue.
+func (r *RedisSortedSetFlow) releaseClaimed(queueName string, claimed []claimedRequest, logger logr.Logger) {
+	for _, c := range claimed {
+		reqID := c.ir.PublicRequest.ReqID()
+		if err := retryRedisOp(context.Background(), func(ctx context.Context) error {
+			return r.releaseClaim(ctx, queueName, reqID, c.ir.RequestToken, c.member, c.ir.QueueScore(), c.token)
+		}); err != nil {
+			logger.V(logutil.DEFAULT).Error(err, "Failed to release claim", "id", reqID)
+		}
+		pipeline.ReleaseGateReleases(c.releases)
+	}
+}
+
+// fetchPayloads attaches each request's referenced payload with one MGET and
+// returns, per request, why its payload is unavailable ("" when ready).
+func (r *RedisSortedSetFlow) fetchPayloads(ctx context.Context, claimed []claimedRequest) ([]string, error) {
+	refs := make([]string, len(claimed))
+	for i, c := range claimed {
+		refs[i] = c.ir.PayloadRef
+	}
+	values, err := r.rdb.MGet(ctx, refs...).Result()
+	if err != nil {
+		return nil, fmt.Errorf("fetch %d request payloads: %w", len(refs), err)
+	}
+	errs := make([]string, len(claimed))
+	for i, v := range values {
+		payload, found := v.(string)
+		if !found {
+			errs[i] = "request payload is missing"
+			continue
+		}
+		if err := api.AttachPayload(claimed[i].ir, json.RawMessage(payload)); err != nil {
+			errs[i] = "request payload could not be attached"
+		}
+	}
+	return errs, nil
+}
+
+func encodeRequest(ir *api.InternalRequest) ([]byte, error) {
+	if ir.PayloadRef == "" {
+		return json.Marshal(ir)
+	}
+	envelope, _, err := api.SplitPayload(ir)
+	return envelope, err
 }
 
 func (r *RedisSortedSetFlow) parseMessage(member string, logger logr.Logger) (*api.InternalRequest, float64, bool) {
@@ -1087,7 +1185,7 @@ func (r *RedisSortedSetFlow) flushRetryBatch(ctx context.Context, batch []pipeli
 		// Preserve the origin queue in the envelope so the retry mover can
 		// re-enter the message into the right queue once it is due.
 		msg.RequestQueueName = queueName
-		bytes, err := json.Marshal(msg.InternalRequest)
+		bytes, err := encodeRequest(msg.InternalRequest)
 		if err != nil {
 			logger.V(logutil.DEFAULT).Error(err, "Failed to marshal retry")
 			continue
@@ -1233,7 +1331,7 @@ func (r *RedisSortedSetFlow) flushResultBatch(ctx context.Context, batch []api.R
 		var ok bool
 		err := retryRedisOp(ctx, func(ctx context.Context) error {
 			var aerr error
-			ok, aerr = r.ackResult(ctx, claimQueue, resultQueue, result.ID, result.Routing.RequestToken, r.marshalResult(result), listTTL)
+			ok, aerr = r.ackResult(ctx, claimQueue, resultQueue, result.ID, result.Routing.RequestToken, result.Routing.PayloadRef, r.marshalResult(result), listTTL)
 			return aerr
 		})
 		if err != nil {

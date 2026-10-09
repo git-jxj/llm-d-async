@@ -28,9 +28,13 @@ type RedisSortedSetProducer struct {
 	resultQueueName            string
 	resultClaimLeaseTTL        time.Duration
 	resultClaimReclaimInterval time.Duration
+	payloadKeys                bool
 }
 
-const cancellationMarkerTTL = 7 * 24 * time.Hour
+const (
+	cancellationMarkerTTL = 7 * 24 * time.Hour
+	payloadTTLGrace       = 10 * time.Minute
+)
 
 var markRequestCancelledScript = redis.NewScript(`
 local active = redis.call("GET", KEYS[1])
@@ -50,6 +54,9 @@ redis.call("DEL", KEYS[2])
 redis.call("SET", KEYS[3], ARGV[1], "PX", ARGV[2])
 local score = tonumber(ARGV[6]) + math.min(seq, 2097151) / 2097152
 redis.call("ZADD", KEYS[4], string.format("%.17g", score), ARGV[4] .. seq .. ARGV[5])
+if KEYS[5] then
+  redis.call("SET", KEYS[5], ARGV[7], "PX", ARGV[8])
+end
 return seq
 `)
 
@@ -101,6 +108,14 @@ func WithResultClaimReclaimInterval(interval time.Duration) ProducerOption {
 			return errors.New("WithResultClaimReclaimInterval: duration must be positive")
 		}
 		p.resultClaimReclaimInterval = interval
+		return nil
+	}
+}
+
+// WithPayloadKeys stores each request's payload under its own Redis key.
+func WithPayloadKeys() ProducerOption {
+	return func(p *RedisSortedSetProducer) error {
+		p.payloadKeys = true
 		return nil
 	}
 }
@@ -213,6 +228,7 @@ func toInternalRequest(req api.Request) *api.InternalRequest {
 			Metadata: req.ReqMetadata(),
 			Headers:  req.ReqHeaders(),
 			Endpoint: req.ReqEndpoint(),
+			Model:    req.ReqModel(),
 		}
 		return ir
 	}
@@ -255,14 +271,26 @@ func (p *RedisSortedSetProducer) SubmitRequest(ctx context.Context, req api.Requ
 		return fmt.Errorf("failed to create request token: %w", err)
 	}
 	ir.RequestToken = token
-
 	ir.EnqueueSeq = enqueueSeqPlaceholder
 
-	msgBytes, err := json.Marshal(ir)
+	if payload := r.ReqPayload(); payload != nil {
+		trimmed := bytes.TrimSpace(payload)
+		if !json.Valid(trimmed) || (trimmed[0] != '{' && string(trimmed) != "null") {
+			return errors.New("invalid payload: must be a JSON object or null")
+		}
+	}
+
+	var envelope, payload []byte
+	if p.payloadKeys {
+		ir.PayloadRef = api.RequestPayloadKey(r.ReqID(), token)
+		envelope, payload, err = api.SplitPayload(ir)
+	} else {
+		envelope, err = json.Marshal(ir)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
-	at := bytes.Index(msgBytes, []byte(enqueueSeqPlaceholderJSON))
+	at := bytes.Index(envelope, []byte(enqueueSeqPlaceholderJSON))
 	if at < 0 {
 		return errors.New("marshaled request is missing the enqueue_seq placeholder")
 	}
@@ -271,20 +299,25 @@ func (p *RedisSortedSetProducer) SubmitRequest(ctx context.Context, req api.Requ
 	// This prevents a previously cancelled/completed request ID from poisoning
 	// a later submission that legitimately reuses the same ID.
 	targetQueue := ir.RequestQueueName
-	err = submitRequestScript.Run(ctx, p.client,
-		[]string{
-			enqueueSeqKey(targetQueue, deadline),
-			api.RequestCancellationKey(r.ReqID()),
-			api.RequestActiveTokenKey(r.ReqID()),
-			targetQueue,
-		},
+	keys := []string{
+		enqueueSeqKey(targetQueue, deadline),
+		api.RequestCancellationKey(r.ReqID()),
+		api.RequestActiveTokenKey(r.ReqID()),
+		targetQueue,
+	}
+	args := []any{
 		ir.RequestToken,
 		max(activeTTL.Milliseconds(), 1),
 		time.Unix(deadline, 0).Add(enqueueSeqGrace).Unix(),
-		msgBytes[:at+len(enqueueSeqFieldJSON)],
-		msgBytes[at+len(enqueueSeqPlaceholderJSON):],
+		envelope[:at+len(enqueueSeqFieldJSON)],
+		envelope[at+len(enqueueSeqPlaceholderJSON):],
 		deadline,
-	).Err()
+	}
+	if ir.PayloadRef != "" {
+		keys = append(keys, ir.PayloadRef)
+		args = append(args, payload, (activeTTL + payloadTTLGrace).Milliseconds())
+	}
+	err = submitRequestScript.Run(ctx, p.client, keys, args...).Err()
 	if err != nil {
 		return fmt.Errorf("failed to add request to queue: %w", err)
 	}

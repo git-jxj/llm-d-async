@@ -14,16 +14,24 @@ AP_IMAGE_PULL_POLICY=Always
 ```bash
 make deploy-ap-on-k8s
 ```
-- To test a request (only for the Redis implementation):
+- To test a request with the `redis-pubsub` transport, use the request and result
+  channel names from your transport configuration (the examples below use
+  `request-queue` and `result-queue`). For the recommended `redis-sortedset`
+  transport, use a [producer](development.md#development) instead of `PUBLISH`.
     - Subscribing to the result channel (different terminal window):
     ```bash
        export REDIS_IP=....
-       kubectl run -i -t subscriberbox --rm --image=redis --restart=Never -- /usr/local/bin/redis-cli -h $REDIS_IP SUBSCRIBE result-queue
+       kubectl run -i subscriberbox --rm --image=redis --restart=Never -- /usr/local/bin/redis-cli -h "$REDIS_IP" SUBSCRIBE result-queue
     ```
-    - Publishing a request:
+    - Publishing a request, replacing `food-review-1` with a model served by your
+      inference gateway. Direct broker messages must use the
+      [internal wire format](transports.md#internal-wire-format):
     ```bash
        export REDIS_IP=....
-       kubectl run --rm -i -t publishmsgbox --image=redis --restart=Never -- /usr/local/bin/redis-cli -h $REDIS_IP PUBLISH request-queue '{"id" : "testmsg", "payload":{ "model":"food-review-1", "prompt":"Hi, good morning "}, "deadline" :23472348233323 }'
+       export MODEL=food-review-1
+       DEADLINE=$(($(date +%s) + 300))
+       REQUEST="{\"request_kind\":\"plain\",\"data\":{\"id\":\"testmsg\",\"payload\":{\"model\":\"$MODEL\",\"prompt\":\"Hi, good morning\",\"max_tokens\":16},\"deadline\":$DEADLINE}}"
+       kubectl run --rm -i publishmsgbox --image=redis --restart=Never -- /usr/local/bin/redis-cli -h "$REDIS_IP" PUBLISH request-queue "$REQUEST"
      ```
 
 ## Command Line Parameters
